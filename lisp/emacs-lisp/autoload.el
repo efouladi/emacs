@@ -167,7 +167,9 @@ expression, in which case we want to handle forms differently."
                        define-inline cl-defun cl-defmacro cl-defgeneric
                        cl-defstruct pcase-defmacro))
            (macrop car)
-	   (setq expand (let ((load-file-name file)) (macroexpand form)))
+	   (setq expand (let ((load-true-file-name file)
+                              (load-file-name file))
+                          (macroexpand form)))
 	   (memq (car expand) '(progn prog1 defalias)))
       (make-autoload expand file 'expansion)) ;Recurse on the expansion.
 
@@ -1045,7 +1047,7 @@ write its autoloads into the specified file instead."
                        ;; we don't want to depend on whether Emacs was
                        ;; built with or without modules support, nor
                        ;; what is the suffix for the underlying OS.
-		       (unless (string-match "\\.\\(elc\\|so\\|dll\\)" suf)
+		       (unless (string-match "\\.\\(elc\\|eln\\|so\\|dll\\)" suf)
                          (push suf tmp)))
                      (concat "\\`[^=.].*" (regexp-opt tmp t) "\\'")))
 	 (files (apply #'nconc

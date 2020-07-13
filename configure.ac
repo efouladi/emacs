@@ -469,6 +469,7 @@ OPTION_DEFAULT_ON([gnutls],[don't use -lgnutls for SSL/TLS support])
 OPTION_DEFAULT_ON([zlib],[don't compile with zlib decompression support])
 OPTION_DEFAULT_ON([modules],[don't compile with dynamic modules support])
 OPTION_DEFAULT_ON([threads],[don't compile with elisp threading support])
+OPTION_DEFAULT_OFF([nativecomp],[compile with Emacs Lisp native compiler support])
 
 AC_ARG_WITH([file-notification],[AS_HELP_STRING([--with-file-notification=LIB],
  [use a file notification library (LIB one of: yes, inotify, kqueue, gfile, w32, no)])],
@@ -3731,6 +3732,7 @@ AC_SUBST(LIBZ)
 LIBMODULES=
 HAVE_MODULES=no
 MODULES_OBJ=
+NEED_DYNLIB=no
 case $opsys in
   cygwin|mingw32) MODULES_SUFFIX=".dll" ;;
   darwin) MODULES_SUFFIX=".dylib" ;;
@@ -3766,7 +3768,8 @@ if test "${with_modules}" != "no"; then
 fi
 
 if test "${HAVE_MODULES}" = yes; then
-   MODULES_OBJ="dynlib.o emacs-module.o"
+   MODULES_OBJ="emacs-module.o"
+   NEED_DYNLIB=yes
    AC_DEFINE(HAVE_MODULES, 1, [Define to 1 if dynamic modules are enabled])
    AC_DEFINE_UNQUOTED(MODULES_SUFFIX, "$MODULES_SUFFIX",
      [System extension for dynamic libraries])
@@ -3792,6 +3795,91 @@ module_env_snippet_27="$srcdir/src/module-env-27.h"
 module_env_snippet_28="$srcdir/src/module-env-28.h"
 emacs_major_version="${PACKAGE_VERSION%%.*}"
 AC_SUBST(emacs_major_version)
+
+### Emacs Lisp native compiler support
+
+AC_DEFUN([libgccjit_smoke_test], [
+  AC_LANG_SOURCE(
+    [[#include <libgccjit.h>
+      #include <stdlib.h>
+      #include <stdio.h>
+      int
+      main (int argc, char **argv)
+      {
+        gcc_jit_context *ctxt;
+        gcc_jit_result *result;
+        ctxt = gcc_jit_context_acquire ();
+        if (!ctxt)
+          exit (1);
+        gcc_jit_type *int_type =
+          gcc_jit_context_get_type (ctxt, GCC_JIT_TYPE_INT);
+        gcc_jit_function *func =
+          gcc_jit_context_new_function (ctxt, NULL,
+                                        GCC_JIT_FUNCTION_EXPORTED,
+                                        int_type, "foo", 0, NULL, 0);
+        gcc_jit_block *block = gcc_jit_function_new_block (func, "foo");
+        gcc_jit_block_end_with_return (
+          block,
+          NULL,
+          gcc_jit_context_new_rvalue_from_int (ctxt, int_type, 1));
+        result = gcc_jit_context_compile (ctxt);
+        if (!result)
+          exit (1);
+        typedef int (*fn_type) (void);
+        fn_type foo =
+          (fn_type)gcc_jit_result_get_code (result, "foo");
+        if (!foo)
+          exit (1);
+        if (foo () != 1)
+          exit (1);
+        gcc_jit_context_release (ctxt);
+        gcc_jit_result_release (result);
+        return 0;
+      }]])])
+
+AC_DEFUN([libgccjit_not_found], [
+  AC_MSG_ERROR([elisp native compiler requested but libgccjit not found.
+If you are sure you want Emacs compiled without elisp native compiler, pass
+  --without-nativecomp
+to configure.])])
+
+AC_DEFUN([libgccjit_broken], [
+  AC_MSG_ERROR([Installed libgccjit has failed passing the smoke test.
+You can verify it yourself compiling:
+<https://gcc.gnu.org/onlinedocs/jit/intro/tutorial01.html>.
+Please report the issue to your distribution.
+Here instructions on how to compile and install libgccjit from source:
+<https://gcc.gnu.org/wiki/JIT>.])])
+
+HAVE_NATIVE_COMP=no
+LIBGCCJIT_LIB=
+if test "${with_nativecomp}" != "no"; then
+    emacs_save_LIBS=$LIBS
+    LIBS="-lgccjit"
+    AC_RUN_IFELSE([libgccjit_smoke_test], [], [libgccjit_broken],
+      [AC_LINK_IFELSE([libgccjit_smoke_test], [], [libgccjit_not_found])])
+    LIBS=$emacs_save_LIBS
+    HAVE_NATIVE_COMP=yes
+    # mingw32 loads the library dynamically.
+    if test "${opsys}" != "mingw32"; then
+      LIBGCCJIT_LIB="-lgccjit -ldl"
+    fi
+    NEED_DYNLIB=yes
+    AC_DEFINE(HAVE_NATIVE_COMP, 1, [Define to 1 if you have the libgccjit library (-lgccjit).])
+fi
+if test "${HAVE_NATIVE_COMP}" = yes && test "${HAVE_PDUMPER}" = no; then
+   AC_MSG_ERROR(['--with-nativecomp' requires '--with-dumping=pdumper'])
+fi
+AC_DEFINE_UNQUOTED(NATIVE_ELISP_SUFFIX, ".eln",
+  [System extension for native compiled elisp])
+AC_SUBST(HAVE_NATIVE_COMP)
+AC_SUBST(LIBGCCJIT_LIB)
+
+DYNLIB_OBJ=
+if test "${NEED_DYNLIB}" = yes; then
+  DYNLIB_OBJ="dynlib.o"
+fi
+AC_SUBST(DYNLIB_OBJ)
 
 ### Use -lpng if available, unless '--with-png=no'.
 HAVE_PNG=no
@@ -5794,6 +5882,7 @@ AS_ECHO(["  Does Emacs use -lXaw3d?                                 ${HAVE_XAW3D
   Does Emacs support the portable dumper?                 ${with_pdumper}
   Does Emacs support legacy unexec dumping?               ${with_unexec}
   Which dumping strategy does Emacs use?                  ${with_dumping}
+  Does Emacs have native lisp compiler?                   ${HAVE_NATIVE_COMP}
 "])
 
 if test -n "${EMACSDATA}"; then

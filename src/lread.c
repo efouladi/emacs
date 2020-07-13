@@ -1056,14 +1056,31 @@ This uses the variables `load-suffixes' and `load-file-rep-suffixes'.  */)
     {
       Lisp_Object exts = Vload_file_rep_suffixes;
       Lisp_Object suffix = XCAR (suffixes);
-      FOR_EACH_TAIL (exts)
-	lst = Fcons (concat2 (suffix, XCAR (exts)), lst);
+      bool native_code_suffix =
+	NATIVE_COMP_FLAG
+        && strcmp (NATIVE_ELISP_SUFFIX, SSDATA (suffix)) == 0;
+
+#ifdef HAVE_MODULES
+      native_code_suffix =
+	native_code_suffix || strcmp (MODULES_SUFFIX, SSDATA (suffix)) == 0;
+#ifdef MODULES_SECONDARY_SUFFIX
+      native_code_suffix =
+	native_code_suffix
+	|| strcmp (MODULES_SECONDARY_SUFFIX, SSDATA (suffix)) == 0;
+#endif
+#endif
+
+      if (native_code_suffix)
+	lst = Fcons (suffix, lst);
+      else
+        FOR_EACH_TAIL (exts)
+          lst = Fcons (concat2 (suffix, XCAR (exts)), lst);
     }
   return Fnreverse (lst);
 }
 
 /* Return true if STRING ends with SUFFIX.  */
-static bool
+bool
 suffix_p (Lisp_Object string, const char *suffix)
 {
   ptrdiff_t suffix_len = strlen (suffix);
@@ -1080,6 +1097,14 @@ close_infile_unwind (void *arg)
   eassert (infile && infile != prev_infile);
   fclose (infile->stream);
   infile = prev_infile;
+}
+
+static Lisp_Object
+parent_directory (Lisp_Object directory)
+{
+  return Ffile_name_directory (Fsubstring (directory,
+					   make_fixnum (0),
+					   Fsub1 (Flength (directory))));
 }
 
 DEFUN ("load", Fload, Sload, 1, 5, 0,
@@ -1189,7 +1214,7 @@ Return t if the file exists and loads successfully.  */)
               || suffix_p (file, MODULES_SECONDARY_SUFFIX)
 #endif
 #endif
-	      )
+              || (NATIVE_COMP_FLAG && suffix_p (file, NATIVE_ELISP_SUFFIX)))
 	    must_suffix = Qnil;
 	  /* Don't insist on adding a suffix
 	     if the argument includes a directory name.  */
@@ -1206,7 +1231,8 @@ Return t if the file exists and loads successfully.  */)
 	    suffixes = CALLN (Fappend, suffixes, Vload_file_rep_suffixes);
 	}
 
-      fd = openp (Vload_path, file, suffixes, &found, Qnil, load_prefer_newer);
+      fd =
+	openp (Vload_path, file, suffixes, &found, Qnil, load_prefer_newer);
     }
 
   if (fd == -1)
@@ -1266,6 +1292,9 @@ Return t if the file exists and loads successfully.  */)
 #else
   bool is_module = false;
 #endif
+
+  bool is_native_elisp =
+    NATIVE_COMP_FLAG && suffix_p (found, NATIVE_ELISP_SUFFIX) ? true : false;
 
   /* Check if we're stuck in a recursive load cycle.
 
@@ -1361,7 +1390,7 @@ Return t if the file exists and loads successfully.  */)
             } /* !load_prefer_newer */
 	}
     }
-  else if (!is_module)
+  else if (!is_module && !is_native_elisp)
     {
       /* We are loading a source file (*.el).  */
       if (!NILP (Vload_source_file_function))
@@ -1388,7 +1417,7 @@ Return t if the file exists and loads successfully.  */)
       stream = NULL;
       errno = EINVAL;
     }
-  else if (!is_module)
+  else if (!is_module && !is_native_elisp)
     {
 #ifdef WINDOWSNT
       emacs_close (fd);
@@ -1404,7 +1433,7 @@ Return t if the file exists and loads successfully.  */)
      might be accessed by the unbind_to call below.  */
   struct infile input;
 
-  if (is_module)
+  if (is_module || is_native_elisp)
     {
       /* `module-load' uses the file name, so we can close the stream
          now.  */
@@ -1431,6 +1460,8 @@ Return t if the file exists and loads successfully.  */)
     {
       if (is_module)
         message_with_string ("Loading %s (module)...", file, 1);
+      else if (is_native_elisp)
+        message_with_string ("Loading %s (native compiled elisp)...", file, 1);
       else if (!compiled)
 	message_with_string ("Loading %s (source)...", file, 1);
       else if (newer)
@@ -1440,7 +1471,20 @@ Return t if the file exists and loads successfully.  */)
 	message_with_string ("Loading %s...", file, 1);
     }
 
-  specbind (Qload_file_name, found);
+  if (is_native_elisp)
+    {
+      /* Many packages use `load-file-name' as a way to obtain the
+	 package location (see bug#40099).  .eln files are not in the
+	 same folder of their respective sources therfore not to break
+	 packages we fake `load-file-name' here.  The non faked
+	 version of it is `load-true-file-name'. */
+      specbind (Qload_file_name,
+		concat2 (parent_directory (Ffile_name_directory (found)),
+			 Ffile_name_nondirectory (found)));
+    }
+  else
+    specbind (Qload_file_name, found);
+  specbind (Qload_true_file_name, found);
   specbind (Qinhibit_file_name_operation, Qnil);
   specbind (Qload_in_progress, Qt);
 
@@ -1455,6 +1499,26 @@ Return t if the file exists and loads successfully.  */)
       /* This cannot happen.  */
       emacs_abort ();
 #endif
+    }
+  else if (is_native_elisp)
+    {
+#ifdef HAVE_NATIVE_COMP
+      specbind (Qcurrent_load_list, Qnil);
+      if (!NILP (Vpurify_flag))
+	{
+	  Lisp_Object base = concat2 (parent_directory (Vinvocation_directory),
+				      build_string ("lisp/"));
+	  Lisp_Object offset = Flength (base);
+	  hist_file_name = Fsubstring (found, offset, Qnil);
+	}
+      LOADHIST_ATTACH (hist_file_name);
+      Fnative_elisp_load (found, Qnil);
+      build_load_history (hist_file_name, true);
+#else
+      /* This cannot happen.  */
+      emacs_abort ();
+#endif
+
     }
   else
     {
@@ -1491,6 +1555,8 @@ Return t if the file exists and loads successfully.  */)
     {
       if (is_module)
         message_with_string ("Loading %s (module)...done", file, 1);
+      else if (is_native_elisp)
+	message_with_string ("Loading %s (native compiled elisp)...done", file, 1);
       else if (!compiled)
 	message_with_string ("Loading %s (source)...done", file, 1);
       else if (newer)
@@ -1542,6 +1608,120 @@ directories, make sure the PREDICATE function returns `dir-ok' for them.  */)
   return file;
 }
 
+/* This function turns a list of suffixes into a list of middle dirs
+   and suffixes.  If the suffix is not NATIVE_ELISP_SUFFIX then its
+   suffix is nil and it is added to the list as is.  Instead, if it
+   suffix is NATIVE_ELISP_SUFFIX then two elements are added to the
+   list.  The first one has middledir equal to nil and the second uses
+   comp-native-path-postfix as middledir.  This is because we'd like
+   to search for dir/foo.eln before dir/middledir/foo.eln.
+
+For example, it turns this:
+
+(".eln" ".elc" ".elc.gz" ".el" ".el.gz")
+
+ into this:
+
+((nil . ".eln")
+ (comp-native-path-postfix . ".eln")
+ (nil . ".elc")
+ (nil . ".elc.gz")
+ (nil . ".el")
+ (nil . ".el.gz"))
+*/
+static Lisp_Object
+openp_add_middle_dir_to_suffixes (Lisp_Object suffixes)
+{
+  Lisp_Object tail = suffixes;
+  Lisp_Object extended_suf = Qnil;
+  FOR_EACH_TAIL_SAFE (tail)
+    {
+      /*  suffixes may be a stack-based cons pointing to stack-based
+          strings.  We must copy the suffix if we are putting it into
+          a heap-based cons to avoid a dangling reference.  This would
+          lead to crashes during the GC.  */
+      CHECK_STRING_CAR (tail);
+      char * suf = SSDATA (XCAR (tail));
+      Lisp_Object copied_suffix = build_string (suf);
+#ifdef HAVE_NATIVE_COMP
+      if (strcmp (NATIVE_ELISP_SUFFIX, suf) == 0)
+        {
+          CHECK_STRING (Vcomp_native_path_postfix);
+          /* Here we add them in the opposite order so that nreverse
+             corrects it.  */
+          extended_suf = Fcons (Fcons (Qnil, copied_suffix), extended_suf);
+          extended_suf = Fcons (Fcons (Vcomp_native_path_postfix,
+                                       copied_suffix),
+                                extended_suf);
+        }
+      else
+#endif
+	extended_suf = Fcons (Fcons (Qnil, copied_suffix), extended_suf);
+    }
+
+  suffixes = Fnreverse (extended_suf);
+  return suffixes;
+}
+
+/*  This function takes a list of middledirs and suffixes and returns
+    the maximum buffer space that this part of the filename will
+    need.  */
+static ptrdiff_t
+openp_max_middledir_and_suffix_len (Lisp_Object middledir_and_suffixes)
+{
+  ptrdiff_t max_extra_len = 0;
+  Lisp_Object tail = middledir_and_suffixes;
+  FOR_EACH_TAIL_SAFE (tail)
+    {
+      Lisp_Object middledir_and_suffix = XCAR (tail);
+      Lisp_Object middledir = XCAR (middledir_and_suffix);
+      Lisp_Object suffix = XCDR (middledir_and_suffix);
+      ptrdiff_t len = SBYTES (suffix);
+      if (!NILP (middledir))
+          len += 2 + SBYTES (middledir); /* Add two slashes.  */
+      max_extra_len = max (max_extra_len, len);
+    }
+  return max_extra_len;
+}
+
+/*  This function completes the FN buffer with the middledir,
+    basenameme, and suffix.  It takes the directory length in DIRNAME,
+    but it requires that it has been copied already to the start of
+    the buffer.
+
+    After this function the FN buffer will be (depending on middledir)
+    dirname/middledir/basename.suffix
+    or
+    dirname/basename.suffix
+*/
+static ptrdiff_t
+openp_fill_filename_buffer (char *fn, ptrdiff_t dirnamelen,
+                            Lisp_Object basenamewext,
+                            Lisp_Object middledir_and_suffix)
+{
+  Lisp_Object middledir = XCAR (middledir_and_suffix);
+  Lisp_Object suffix = XCDR (middledir_and_suffix);
+  ptrdiff_t basenamewext_len = SBYTES (basenamewext);
+  ptrdiff_t fnlen, lsuffix = SBYTES (suffix);
+  ptrdiff_t lmiddledir = 0;
+  if (!NILP (middledir))
+    {
+      /* Add 1 for the slash.  */
+      lmiddledir = SBYTES (middledir) + 1;
+      memcpy (fn + dirnamelen, SDATA (middledir),
+              lmiddledir - 1);
+      fn[dirnamelen + (lmiddledir - 1)] = '/';
+    }
+
+  memcpy (fn + dirnamelen + lmiddledir, SDATA (basenamewext),
+          basenamewext_len);
+  /* Make complete filename by appending SUFFIX.  */
+  memcpy (fn + dirnamelen + lmiddledir + basenamewext_len,
+          SDATA (suffix), lsuffix + 1);
+  fnlen = dirnamelen + lmiddledir + basenamewext_len + lsuffix;
+  return fnlen;
+}
+
 /* Search for a file whose name is STR, looking in directories
    in the Lisp list PATH, and trying suffixes from SUFFIX.
    On success, return a file descriptor (or 1 or -2 as described below).
@@ -1579,7 +1759,8 @@ openp (Lisp_Object path, Lisp_Object str, Lisp_Object suffixes,
   ptrdiff_t want_length;
   Lisp_Object filename;
   Lisp_Object string, tail, encoded_fn, save_string;
-  ptrdiff_t max_suffix_len = 0;
+  Lisp_Object middledir_and_suffixes;
+  ptrdiff_t max_extra_len = 0;
   int last_errno = ENOENT;
   int save_fd = -1;
   USE_SAFE_ALLOCA;
@@ -1590,13 +1771,9 @@ openp (Lisp_Object path, Lisp_Object str, Lisp_Object suffixes,
 
   CHECK_STRING (str);
 
-  tail = suffixes;
-  FOR_EACH_TAIL_SAFE (tail)
-    {
-      CHECK_STRING_CAR (tail);
-      max_suffix_len = max (max_suffix_len,
-			    SBYTES (XCAR (tail)));
-    }
+  middledir_and_suffixes = openp_add_middle_dir_to_suffixes (suffixes);
+
+  max_extra_len = openp_max_middledir_and_suffix_len (middledir_and_suffixes);
 
   string = filename = encoded_fn = save_string = Qnil;
 
@@ -1613,7 +1790,7 @@ openp (Lisp_Object path, Lisp_Object str, Lisp_Object suffixes,
      executable. */
   FOR_EACH_TAIL_SAFE (path)
    {
-    ptrdiff_t baselen, prefixlen;
+    ptrdiff_t dirnamelen, prefixlen;
 
     if (EQ (path, just_use_str))
       filename = str;
@@ -1630,35 +1807,40 @@ openp (Lisp_Object path, Lisp_Object str, Lisp_Object suffixes,
 	  continue;
       }
 
+
     /* Calculate maximum length of any filename made from
        this path element/specified file name and any possible suffix.  */
-    want_length = max_suffix_len + SBYTES (filename);
+    want_length = max_extra_len + SBYTES (filename);
     if (fn_size <= want_length)
       {
 	fn_size = 100 + want_length;
 	fn = SAFE_ALLOCA (fn_size);
       }
 
-    /* Copy FILENAME's data to FN but remove starting /: if any.  */
-    prefixlen = ((SCHARS (filename) > 2
-		  && SREF (filename, 0) == '/'
-		  && SREF (filename, 1) == ':')
-		 ? 2 : 0);
-    baselen = SBYTES (filename) - prefixlen;
-    memcpy (fn, SDATA (filename) + prefixlen, baselen);
+    Lisp_Object dirnamewslash = Ffile_name_directory (filename);
+    Lisp_Object basenamewext = Ffile_name_nondirectory (filename);
 
-    /* Loop over suffixes.  */
-    AUTO_LIST1 (empty_string_only, empty_unibyte_string);
-    tail = NILP (suffixes) ? empty_string_only : suffixes;
+    /* Copy FILENAME's data to FN but remove starting /: if any.  */
+    prefixlen = ((SCHARS (dirnamewslash) > 2
+		  && SREF (dirnamewslash, 0) == '/'
+		  && SREF (dirnamewslash, 1) == ':')
+		 ? 2 : 0);
+    dirnamelen = SBYTES (dirnamewslash) - prefixlen;
+    memcpy (fn, SDATA (dirnamewslash) + prefixlen, dirnamelen);
+
+    /* Loop over middledir_and_suffixes.  */
+    AUTO_LIST1 (empty_string_only, Fcons (Qnil, empty_unibyte_string));
+    tail = NILP (middledir_and_suffixes) ? empty_string_only
+                                         : middledir_and_suffixes;
     FOR_EACH_TAIL_SAFE (tail)
       {
-	Lisp_Object suffix = XCAR (tail);
-	ptrdiff_t fnlen, lsuffix = SBYTES (suffix);
+	Lisp_Object middledir_and_suffix = XCAR (tail);
+        Lisp_Object suffix = XCDR (middledir_and_suffix);
 	Lisp_Object handler;
 
-	/* Make complete filename by appending SUFFIX.  */
-	memcpy (fn + baselen, SDATA (suffix), lsuffix + 1);
-	fnlen = baselen + lsuffix;
+        ptrdiff_t fnlen = openp_fill_filename_buffer (fn, dirnamelen,
+                                                      basenamewext,
+                                                      middledir_and_suffix);
 
 	/* Check that the file exists and is not a directory.  */
 	/* We used to only check for handlers on non-absolute file names:
@@ -1886,8 +2068,8 @@ readevalloop_1 (int old)
 static AVOID
 end_of_file_error (void)
 {
-  if (STRINGP (Vload_file_name))
-    xsignal1 (Qend_of_file, Vload_file_name);
+  if (STRINGP (Vload_true_file_name))
+    xsignal1 (Qend_of_file, Vload_true_file_name);
 
   xsignal0 (Qend_of_file);
 }
@@ -3138,7 +3320,7 @@ read1 (Lisp_Object readcharfun, int *pch, bool first_in_list)
 	  goto retry;
 	}
       if (c == '$')
-	return Vload_file_name;
+	return Vload_true_file_name;
       if (c == '\'')
 	return list2 (Qfunction, read0 (readcharfun));
       /* #:foo is the uninterned symbol named foo.  */
@@ -3939,7 +4121,7 @@ read_list (bool flag, Lisp_Object readcharfun)
       first_in_list = 0;
 
       /* While building, if the list starts with #$, treat it specially.  */
-      if (EQ (elt, Vload_file_name)
+      if (EQ (elt, Vload_true_file_name)
 	  && ! NILP (elt)
 	  && !NILP (Vpurify_flag))
 	{
@@ -3960,7 +4142,7 @@ read_list (bool flag, Lisp_Object readcharfun)
 	      elt = concat2 (dot_dot_lisp, Ffile_name_nondirectory (elt));
 	    }
 	}
-      else if (EQ (elt, Vload_file_name)
+      else if (EQ (elt, Vload_true_file_name)
 	       && ! NILP (elt)
 	       && load_force_doc_strings)
 	doc_reference = 2;
@@ -4145,10 +4327,14 @@ intern_c_string_1 (const char *str, ptrdiff_t len)
 
   if (!SYMBOLP (tem))
     {
-      /* Creating a non-pure string from a string literal not implemented yet.
-	 We could just use make_string here and live with the extra copy.  */
-      eassert (!NILP (Vpurify_flag));
-      tem = intern_driver (make_pure_c_string (str, len), obarray, tem);
+      Lisp_Object string;
+
+      if (NILP (Vpurify_flag))
+	string = make_string (str, len);
+      else
+	string = make_pure_c_string (str, len);
+
+      tem = intern_driver (string, obarray, tem);
     }
   return tem;
 }
@@ -4408,6 +4594,10 @@ defsubr (union Aligned_Lisp_Subr *aname)
   XSETPVECTYPE (sname, PVEC_SUBR);
   XSETSUBR (tem, sname);
   set_symbol_function (sym, tem);
+#ifdef HAVE_NATIVE_COMP
+  eassert (NILP (Vcomp_abi_hash));
+  Vcomp_subr_list = Fpurecopy (Fcons (tem, Vcomp_subr_list));
+#endif
 }
 
 #ifdef NOTDEF /* Use fset in subr.el now!  */
@@ -4708,6 +4898,7 @@ init_lread (void)
 
   load_in_progress = 0;
   Vload_file_name = Qnil;
+  Vload_true_file_name = Qnil;
   Vstandard_input = Qt;
   Vloads_in_progress = Qnil;
 }
@@ -4831,21 +5022,19 @@ This list includes suffixes for both compiled and source Emacs Lisp files.
 This list should not include the empty string.
 `load' and related functions try to append these suffixes, in order,
 to the specified file name if a suffix is allowed or required.  */);
-#ifdef HAVE_MODULES
-#ifdef MODULES_SECONDARY_SUFFIX
-  Vload_suffixes = list4 (build_pure_c_string (".elc"),
-			  build_pure_c_string (".el"),
-			  build_pure_c_string (MODULES_SUFFIX),
-                          build_pure_c_string (MODULES_SECONDARY_SUFFIX));
-#else
-  Vload_suffixes = list3 (build_pure_c_string (".elc"),
-			  build_pure_c_string (".el"),
-			  build_pure_c_string (MODULES_SUFFIX));
-#endif
-#else
   Vload_suffixes = list2 (build_pure_c_string (".elc"),
 			  build_pure_c_string (".el"));
+#ifdef HAVE_MODULES
+  Vload_suffixes = Fcons (build_pure_c_string (MODULES_SUFFIX), Vload_suffixes);
+#ifdef MODULES_SECONDARY_SUFFIX
+  Vload_suffixes =
+    Fcons (build_pure_c_string (MODULES_SECONDARY_SUFFIX), Vload_suffixes);
 #endif
+#endif
+#ifdef HAVE_NATIVE_COMP
+  Vload_suffixes = Fcons (build_pure_c_string (NATIVE_ELISP_SUFFIX), Vload_suffixes);
+#endif
+
   DEFVAR_LISP ("module-file-suffix", Vmodule_file_suffix,
 	       doc: /* Suffix of loadable module file, or nil if modules are not supported.  */);
 #ifdef HAVE_MODULES
@@ -4911,8 +5100,14 @@ directory.  These file names are converted to absolute at startup.  */);
   Vload_history = Qnil;
 
   DEFVAR_LISP ("load-file-name", Vload_file_name,
-	       doc: /* Full name of file being loaded by `load'.  */);
+	       doc: /* Full name of file being loaded by `load'.
+In case a .eln file is being loaded this is unreliable and `load-true-file-name'
+should be used instead.  */);
   Vload_file_name = Qnil;
+
+  DEFVAR_LISP ("load-true-file-name", Vload_true_file_name,
+	       doc: /* Full name of file being loaded by `load'.  */);
+  Vload_true_file_name = Qnil;
 
   DEFVAR_LISP ("user-init-file", Vuser_init_file,
 	       doc: /* File name, including directory, of user's initialization file.
@@ -5055,6 +5250,7 @@ that are loaded before your customizations are read!  */);
   DEFSYM (Qfunction, "function");
   DEFSYM (Qload, "load");
   DEFSYM (Qload_file_name, "load-file-name");
+  DEFSYM (Qload_true_file_name, "load-true-file-name");
   DEFSYM (Qeval_buffer_list, "eval-buffer-list");
   DEFSYM (Qdir_ok, "dir-ok");
   DEFSYM (Qdo_after_load_evaluation, "do-after-load-evaluation");

@@ -325,12 +325,19 @@ found via `load-path'.  The return value can also be `C-source', which
 means that OBJECT is a function or variable defined in C.  If no
 suitable file is found, return nil."
   (let* ((autoloaded (autoloadp type))
-	 (file-name (or (and autoloaded (nth 1 type))
+	 (true-name (or (and autoloaded (nth 1 type))
 			(symbol-file
                          ;; FIXME: Why do we have this weird "If TYPE is the
                          ;; value returned by `symbol-function' for a function
                          ;; symbol" exception?
-			 object (or (if (symbolp type) type) 'defun)))))
+			 object (or (if (symbolp type) type) 'defun))))
+         (file-name (if (and true-name
+                             (string-match "[.]eln\\'" true-name))
+                        (expand-file-name (concat (file-name-base true-name)
+                                                  ".el")
+		                          (concat (file-name-directory true-name)
+                                                  ".."))
+	              true-name)))
     (cond
      (autoloaded
       ;; An autoloaded function: Locate the file since `symbol-function'
@@ -388,7 +395,7 @@ suitable file is found, return nil."
      ((let ((lib-name
 	     (if (string-match "[.]elc\\'" file-name)
 		 (substring-no-properties file-name 0 -1)
-	       file-name)))
+               file-name)))
 	(or (and (file-readable-p lib-name) lib-name)
 	    ;; The library might be compressed.
 	    (and (file-readable-p (concat lib-name ".gz")) lib-name))))
@@ -737,6 +744,8 @@ Returns a list of the form (REAL-FUNCTION DEF ALIASED REAL-DEF)."
 		 ;; aliases before functions.
 		 (aliased
 		  (format-message "an alias for `%s'" real-def))
+                 ((subr-native-elisp-p def)
+                  "native compiled Lisp function")
 		 ((subrp def)
 		  (concat beg (if (eq 'unevalled (cdr (subr-arity def)))
 		                  "special form"
